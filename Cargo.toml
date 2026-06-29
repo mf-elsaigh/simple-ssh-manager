@@ -1,0 +1,28 @@
+[package]
+name = "simple-ssh-manager"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+description = "SSH connection manager with an encrypted server store and embedded terminal"
+license = "MIT"
+authors = ["Mohamed Fawzy <mf.elsaigh@gmail.com>"]
+
+# cargo-deb packaging metadata (`cargo deb`).
+[package.metadata.deb]
+depends = "libgtk-4-1, libvte-2.91-gtk4-0, openssh-client, sshpass"
+section = "net"
+assets = [
+    ["target/release/simple-ssh-manager", "usr/bin/", "755"],
+    ["assets/icon.png", "usr/share/icons/hicolor/512x512/apps/cloud.sadeem.SimpleSshManager.png", "644"],
+    ["assets/cloud.sadeem.SimpleSshManager.desktop", "usr/share/applications/", "644"],
+]
+
+[dependencies]
+gtk4 = { version = "0.11.4", features = ["v4_14"] }
+vte4 = { version = "0.10", features = ["gtk_v4_18"] }
+age = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+gdk4-x11 = { version = "0.11", features = ["xlib"] }
+x11-dl = "2"

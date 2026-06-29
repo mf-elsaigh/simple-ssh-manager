@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Simple SSH Manager
+Comment=SSH connection manager with an encrypted server store and embedded terminal
+Exec=simple-ssh-manager
+Icon=cloud.sadeem.SimpleSshManager
+Terminal=false
+Categories=Network;System;
