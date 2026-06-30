@@ -4,6 +4,7 @@ use std::rc::Rc;
 mod center;
 mod login;
 mod store;
+mod tray;
 
 use gtk4 as gtk;
 use gtk::prelude::*;
@@ -110,8 +111,136 @@ fn build_ui(window: &ApplicationWindow, state: State) {
             show_edit_dialog(&window, state.clone(), list.clone(), None);
         });
     }
+
+    install_tray_and_close(window, &notebook);
+
     // Present now that the window has content + size, so it opens full-sized.
     window.present();
+    // The login flow maps this window empty first, so it realizes at its minimum
+    // and set_default_size won't grow it back. Force the size on the X surface
+    // once the present's map has produced a surface (next idle tick).
+    glib::idle_add_local_once({
+        let window = window.clone();
+        move || center::resize_x11(&window, 900, 600)
+    });
+}
+
+/// Minimize-to-tray + confirm-on-quit.
+///
+/// The window's close button (X) hides the window to the tray instead of
+/// quitting — reversible, so no prompt. Actually quitting (tray "Quit",
+/// Options -> Exit) goes through `confirm_quit`, which asks first.
+fn install_tray_and_close(window: &ApplicationWindow, notebook: &gtk::Notebook) {
+    use std::cell::Cell;
+    // Shared flag: close-request hides to tray unless we're really quitting.
+    let quitting = Rc::new(Cell::new(false));
+
+    // Tray first: if there's no SNI host, the window X must NOT silently hide
+    // (there'd be no way back) — it confirms-and-quits instead.
+    let tray = tray::spawn(APP_ID);
+    let has_tray = tray.is_some();
+
+    {
+        let quitting = quitting.clone();
+        let notebook = notebook.clone();
+        window.connect_close_request(move |w| {
+            if quitting.get() {
+                return glib::Propagation::Proceed; // let the window close -> app exits
+            }
+            if has_tray {
+                w.set_visible(false); // minimize to tray
+            } else {
+                confirm_quit(w, &notebook, &quitting); // no tray -> confirm exit
+            }
+            glib::Propagation::Stop
+        });
+    }
+
+    // Stash the quit path on the window so menu actions can reach it.
+    {
+        let window = window.clone();
+        let notebook = notebook.clone();
+        let quitting = quitting.clone();
+        let quit = gio::SimpleAction::new("quit", None);
+        quit.connect_activate({
+            let window = window.clone();
+            move |_, _| confirm_quit(&window, &notebook, &quitting)
+        });
+        window.add_action(&quit);
+    }
+
+    // Tray: keep the Handle alive for the app's lifetime by leaking it.
+    if let Some((rx, handle)) = tray {
+        Box::leak(Box::new(handle));
+        let window = window.clone();
+        let notebook = notebook.clone();
+        let quitting = quitting.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(msg) = rx.recv().await {
+                match msg {
+                    tray::TrayMsg::Show => {
+                        window.set_visible(true);
+                        window.present();
+                    }
+                    tray::TrayMsg::Quit => confirm_quit(&window, &notebook, &quitting),
+                }
+            }
+        });
+    }
+}
+
+/// Ask before really quitting; warns if any tab still has a live SSH session.
+fn confirm_quit(window: &ApplicationWindow, notebook: &gtk::Notebook, quitting: &Rc<std::cell::Cell<bool>>) {
+    let active = (0..notebook.n_pages())
+        .filter_map(|i| notebook.nth_page(Some(i)))
+        .filter(tab_is_connected)
+        .count();
+
+    let msg = if active > 0 {
+        format!("{active} connection(s) still open. Quit anyway?")
+    } else {
+        "Quit Simple SSH Manager?".to_string()
+    };
+
+    let dialog = gtk::Window::builder()
+        .title("Quit")
+        .transient_for(window)
+        .modal(true)
+        .destroy_with_parent(true)
+        .build();
+    let label = gtk::Label::builder()
+        .label(msg)
+        .margin_top(16).margin_bottom(8).margin_start(16).margin_end(16)
+        .build();
+    let cancel = gtk::Button::with_label("Cancel");
+    let confirm = gtk::Button::with_label("Quit");
+    confirm.add_css_class("destructive-action");
+    let buttons = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6).halign(gtk::Align::End)
+        .margin_bottom(12).margin_end(12).build();
+    buttons.append(&cancel);
+    buttons.append(&confirm);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content.append(&label);
+    content.append(&buttons);
+    dialog.set_child(Some(&content));
+
+    cancel.connect_clicked({
+        let dialog = dialog.clone();
+        move |_| dialog.close()
+    });
+    confirm.connect_clicked({
+        let dialog = dialog.clone();
+        let window = window.clone();
+        let quitting = quitting.clone();
+        move |_| {
+            quitting.set(true);
+            dialog.close();
+            window.close(); // close-request now proceeds -> app exits
+        }
+    });
+    dialog.present();
 }
 
 /// Build the menu bar: Options (Add / Change Master Password / Exit) and Help (About).
@@ -152,7 +281,7 @@ fn install_menu_actions(window: &ApplicationWindow, state: &State, list: &gtk::L
     let exit = gio::SimpleAction::new("exit", None);
     exit.connect_activate({
         let window = window.clone();
-        move |_, _| window.close()
+        move |_, _| { let _ = gtk::prelude::WidgetExt::activate_action(&window, "win.quit", None); }
     });
     window.add_action(&exit);
 
@@ -684,8 +813,22 @@ fn open_terminal_tab(notebook: &gtk::Notebook, server: &Server) {
         || {},
         -1,
         None::<&gio::Cancellable>,
-        move |_res| {},
+        {
+            // Mark the tab connected once the child spawns; cleared on exit below.
+            let terminal = terminal.clone();
+            move |res| {
+                if res.is_ok() {
+                    unsafe { terminal.set_data("connected", true) };
+                }
+            }
+        },
     );
+    // Child exited (logout, dropped connection) -> tab is no longer "connected",
+    // so closing it won't prompt.
+    terminal.connect_child_exited({
+        let terminal = terminal.clone();
+        move |_, _| unsafe { terminal.set_data("connected", false) }
+    });
 
     let tab_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     let title = gtk::Label::new(Some(&server.name));
@@ -700,10 +843,71 @@ fn open_terminal_tab(notebook: &gtk::Notebook, server: &Server) {
     {
         let notebook = notebook.clone();
         let terminal = terminal.clone();
+        let name = server.name.clone();
         close.connect_clicked(move |_| {
-            if let Some(n) = notebook.page_num(&terminal) {
-                notebook.remove_page(Some(n));
+            let close_page = {
+                let notebook = notebook.clone();
+                let terminal = terminal.clone();
+                move || {
+                    if let Some(n) = notebook.page_num(&terminal) {
+                        notebook.remove_page(Some(n));
+                    }
+                }
+            };
+            // Only prompt while the SSH session is live.
+            if tab_is_connected(terminal.upcast_ref()) {
+                if let Some(window) = notebook.root().and_downcast::<gtk::Window>() {
+                    confirm_close_tab(&window, &name, close_page);
+                    return;
+                }
             }
+            close_page();
         });
     }
+}
+
+/// True if the terminal's child process is still running (set on spawn, cleared
+/// on child-exited).
+fn tab_is_connected(page: &gtk::Widget) -> bool {
+    unsafe { page.data::<bool>("connected").map(|p| *p.as_ref()).unwrap_or(false) }
+}
+
+/// Confirm closing a tab whose SSH session is still connected.
+fn confirm_close_tab(window: &gtk::Window, name: &str, on_confirm: impl Fn() + 'static) {
+    let dialog = gtk::Window::builder()
+        .title("Close Connection")
+        .transient_for(window)
+        .modal(true)
+        .destroy_with_parent(true)
+        .build();
+    let label = gtk::Label::builder()
+        .label(format!("\"{name}\" is still connected. Close this tab?"))
+        .margin_top(16).margin_bottom(8).margin_start(16).margin_end(16)
+        .build();
+    let cancel = gtk::Button::with_label("Cancel");
+    let confirm = gtk::Button::with_label("Close");
+    confirm.add_css_class("destructive-action");
+    let buttons = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6).halign(gtk::Align::End)
+        .margin_bottom(12).margin_end(12).build();
+    buttons.append(&cancel);
+    buttons.append(&confirm);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content.append(&label);
+    content.append(&buttons);
+    dialog.set_child(Some(&content));
+
+    cancel.connect_clicked({
+        let dialog = dialog.clone();
+        move |_| dialog.close()
+    });
+    confirm.connect_clicked({
+        let dialog = dialog.clone();
+        move |_| {
+            on_confirm();
+            dialog.close();
+        }
+    });
+    dialog.present();
 }
